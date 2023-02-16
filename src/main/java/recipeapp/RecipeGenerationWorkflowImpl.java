@@ -1,54 +1,62 @@
 package recipeapp;
 
-import io.temporal.activity.ActivityOptions;
+import io.temporal.failure.ActivityFailure;
 import io.temporal.workflow.Workflow;
-import io.temporal.common.RetryOptions;
 
-import java.time.Duration;
-import java.util.HashMap;
-import java.util.Map;
+// Implementation of the workflow using our built-in failure handling.
 
 public class RecipeGenerationWorkflowImpl implements RecipeGenerationWorkflow {
-    private static final String WITHDRAW = "Withdraw";
-    private static final double price = 1.99;
-    // RetryOptions specify how to automatically handle retries when Activities fail.
-    private final RetryOptions retryoptions = RetryOptions.newBuilder()
-            .setInitialInterval(Duration.ofSeconds(1))
-            .setMaximumInterval(Duration.ofSeconds(100))
-            .setBackoffCoefficient(2)
-            .setMaximumAttempts(500)
-            .build();
-    private final ActivityOptions defaultActivityOptions = ActivityOptions.newBuilder()
-            // Timeout options specify when to automatically timeout Activities if the process is taking too long.
-            .setStartToCloseTimeout(Duration.ofSeconds(5))
-            // Optionally provide customized RetryOptions.
-            // Temporal retries failures by default, this is simply an example.
-            .setRetryOptions(retryoptions)
-            .build();
-    // ActivityStubs enable calls to methods as if the Activity object is local, but actually perform an RPC.
-    private final Map<String, ActivityOptions> perActivityMethodOptions = new HashMap<String, ActivityOptions>() {{
-        put(WITHDRAW, ActivityOptions.newBuilder().setHeartbeatTimeout(Duration.ofSeconds(5)).build());
-    }};
-    private final Money account = Workflow.newActivityStub(Money.class, defaultActivityOptions, perActivityMethodOptions);
-    private final RecipeCreator recipeCreator = Workflow.newActivityStub(RecipeCreator.class, defaultActivityOptions, perActivityMethodOptions);
-    private final Email emailer = Workflow.newActivityStub(Email.class, defaultActivityOptions, perActivityMethodOptions);
+    private static final int priceInCents = 199;
+    private final Money account = Workflow.newActivityStub(Money.class);
+    private final RecipeCreator recipeCreator = Workflow.newActivityStub(RecipeCreator.class);
+    private final GroceryBroker broker = Workflow.newActivityStub(GroceryBrokerImpl.class);
 
-
-    // The transfer method is the entry point to the Workflow.
-    // Activity method executions can be orchestrated here or from within other Activity methods.
+    // Workflow Entrypoint.
     @Override
-    public void generateRecipe(String fromAccountId, String toAccountId, String referenceId,
-                               String ingredients, String email) {
-        chargeAccounts(fromAccountId, toAccountId, referenceId);
-        String result = recipeCreator.make(ingredients);
-        System.out.println("hiiiiii");
-        System.out.println(result);
-        emailer.send(email, result);
+    public void generateRecipe(String fromAccountId, String toAccountId, String idempotencyKey,
+                               String ingredients, GeographicLocation location, String email) {
+        try {
+            chargeAccounts(fromAccountId, toAccountId, idempotencyKey);
+            // "Fail forward" compensation already built in with Temporal via retries if we have
+            // problems connecting to the AI recipe service, so no explicit compensation necessary.
+            String result = recipeCreator.make(ingredients);
+            try {
+                broker.orderGroceries(ingredients, location, fromAccountId, idempotencyKey);
+            } catch (ActivityFailure a) {
+                // Refund the money.
+                chargeAccounts(toAccountId, fromAccountId, idempotencyKey);
+                broker.cancelOrder(fromAccountId, idempotencyKey);
+                sendFailureEmail(email);
+            }
+            shareResult(email, result);
+        } catch (ActivityFailure a) {
+            // Refund the money.
+            chargeAccounts(toAccountId, fromAccountId, idempotencyKey);
+            sendFailureEmail(email);
+            throw a;
+        }
     }
 
-    private void chargeAccounts(String fromAccountId, String toAccountId, String referenceId) {
+    private void chargeAccounts(String fromAccountId, String toAccountId, String idempotencyKey) {
         // Move the $$.
-        account.withdraw(fromAccountId, referenceId, price);
-        account.deposit(toAccountId, referenceId, price);
+        account.withdraw(fromAccountId, idempotencyKey, priceInCents);
+        try {
+            account.deposit(toAccountId, idempotencyKey, priceInCents);
+        } catch (ActivityFailure a) {
+            // Refund if we are unable to make the deposit.
+            account.deposit(fromAccountId, idempotencyKey, priceInCents);
+            throw a;
+        }
+    }
+
+    private void shareResult(String emailAddress, String recipe) {
+        System.out.printf(
+                "\nSending email with recipe to %s. Recipe contents: %s\n", emailAddress, recipe);
+    }
+
+    private void sendFailureEmail(String emailAddress) {
+        System.out.printf("\nSending email to %s to say we could not generate a recipe and order " +
+                        "ingredients.\n",
+                emailAddress);
     }
 }
